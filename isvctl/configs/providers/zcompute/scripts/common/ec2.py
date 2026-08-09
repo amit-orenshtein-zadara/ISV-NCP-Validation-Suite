@@ -571,7 +571,14 @@ def setup_gpu_dependencies(host: str, user: str, key_file: str) -> dict[str, boo
     # pre-existing containerd.io is actually meant to pair with.
     print("[setup] installing Docker ...", file=sys.stderr)
     docker_cmds = (
-        "sudo apt-get update -qq && "
+        # || true: this AMI ships a broken third-party repo entry (Mellanox
+        # DOCA, confirmed live 2026-08-09 - "does not have a Release file"),
+        # which makes apt-get update return non-zero on every run. Since
+        # this whole command is one && chain, that alone silently prevented
+        # Docker from ever installing - the chain died here before even
+        # reaching the actual install step. A genuinely broken Docker/CUDA
+        # repo still fails loudly at the apt-get install line that follows.
+        "sudo apt-get update -qq || true && "
         "sudo apt-get install -y --no-install-recommends curl wget gnupg2 ca-certificates && "
         "if dpkg -l containerd.io 2>/dev/null | grep -q '^ii'; then "
         "  echo '[setup] containerd.io already present — installing docker-ce/docker-ce-cli "
@@ -613,7 +620,10 @@ def setup_gpu_dependencies(host: str, user: str, key_file: str) -> dict[str, boo
         "cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb && "
         "  sudo dpkg -i /tmp/cuda-keyring.deb; "
         "fi && "
-        "sudo apt-get update -qq && "
+        # || true: see docker_cmds above - a broken unrelated third-party
+        # repo (Mellanox DOCA) shouldn't block installing from repos that
+        # do work.
+        "sudo apt-get update -qq || true && "
         # Install nvcc compiler + essential CUDA libraries (much smaller than cuda-toolkit-12-6)
         "sudo apt-get install -y --no-install-recommends "
         "  cuda-nvcc-12-6 cuda-libraries-12-6 libcufft-dev-12-6 libcurand-dev-12-6 && "
@@ -650,7 +660,8 @@ def setup_gpu_dependencies(host: str, user: str, key_file: str) -> dict[str, boo
         "    | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && "
         "  curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list "
         "    | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list && "
-        "  sudo apt-get update -qq && "
+        # || true: see docker_cmds above.
+        "  sudo apt-get update -qq || true && "
         "  sudo apt-get install -y nvidia-container-toolkit; "
         "fi && "
         "sudo nvidia-ctk runtime configure --runtime=docker && "
