@@ -38,7 +38,8 @@ Output JSON:
     "ssh_ready": true,
     "recovery_seconds": 900,
     "nvidia_modules_loaded": true,
-    "gpu_deps": {"docker": true, "nvidia_container_toolkit": true, "cuda_toolkit": true, "nvidia_smi_accessible": true}
+    "gpu_deps": {"docker": true, "nvidia_container_toolkit": true, "cuda_toolkit": true, "nvidia_smi_accessible": true},
+    "nim_image_prepulled": true
 }
 """
 
@@ -59,6 +60,7 @@ from common.ec2 import (  # noqa: E402
     load_nvidia_modules,
     log,
     poll_instance_state,
+    pull_nim_image,
     setup_gpu_dependencies,
     wait_for_private_ip,
     wait_for_public_ip,
@@ -75,6 +77,16 @@ def main() -> int:
     parser.add_argument(
         "--pre-start-delay", type=int, default=600,
         help="Seconds to wait after power-off before issuing start (default: 600)",
+    )
+    parser.add_argument(
+        "--nim-model", default="meta/llama-3.2-1b-instruct",
+        help="NIM model to pre-pull after recovery, matching deploy_nim.py's default",
+    )
+    parser.add_argument("--nim-tag", default="latest", help="NIM container image tag to pre-pull")
+    parser.add_argument(
+        "--ngc-api-key",
+        default=os.environ.get("NGC_API_KEY", "") or os.environ.get("NGC_NIM_API_KEY", ""),
+        help="NGC API key for pre-pulling the NIM image (same env fallback as deploy_nim.py)",
     )
     args = parser.parse_args()
 
@@ -259,6 +271,16 @@ def main() -> int:
             result["gpu_deps"] = setup_gpu_dependencies(result["private_ip"], args.ssh_user, args.key_file)
         except Exception as e:
             log(f"[power-cycle] WARNING: setup_gpu_dependencies failed (non-fatal): {e}")
+
+        # Pre-pull the NIM image here too, right after Docker comes back up -
+        # deploy_nim.py's own docker pull was consuming most of its outer
+        # step timeout on a cold cache (confirmed live 2026-08-09). Best-
+        # effort: never fails this step, deploy_nim.py still pulls again
+        # (near-instantly) if this is skipped/fails.
+        result["nim_image_prepulled"] = pull_nim_image(
+            result["private_ip"], args.ssh_user, args.key_file, args.ngc_api_key,
+            model=args.nim_model, tag=args.nim_tag,
+        )
 
         result["success"] = final_state == "running"
         log(f"[power-cycle] completed successfully! (recovery={result['recovery_seconds']}s)")

@@ -754,3 +754,64 @@ def setup_gpu_dependencies(host: str, user: str, key_file: str) -> dict[str, boo
 
     print(f"[setup] GPU dependencies complete: {results}", file=sys.stderr)
     return results
+
+
+def pull_nim_image(
+    host: str,
+    user: str,
+    key_file: str,
+    ngc_api_key: str,
+    model: str = "meta/llama-3.2-1b-instruct",
+    tag: str = "latest",
+) -> bool:
+    """Pre-pull a NIM container image via SSH, ahead of deploy_nim.py running.
+
+    deploy_nim.py's own docker pull can take most of its 3600s budget on a
+    cold cache, leaving too little of the outer step's 7200s timeout for
+    NGC login + fabric-manager setup + docker run + the health-endpoint
+    poll - confirmed live 2026-08-09 (deploy_nim step timed out with no
+    specific stage error, consistent with the pull alone consuming the
+    whole outer budget). Warming the image cache here, right after the
+    last lifecycle event and before describe_instance/deploy_nim run,
+    means deploy_nim.py's own "docker pull" call resolves near-instantly
+    against an already-local image.
+
+    Args:
+        host:        IP or hostname of the instance.
+        user:        SSH username (e.g. 'ubuntu').
+        key_file:    Path to the private key PEM file.
+        ngc_api_key: NGC API key for the registry login.
+        model:       NIM model name (matches deploy_nim.py's default).
+        tag:         Container image tag.
+
+    Returns:
+        True if the pull succeeded, False otherwise (never raises - this
+        is a best-effort warmup, not a hard requirement).
+    """
+    if not ngc_api_key:
+        log("[nim-pull] NGC_API_KEY not set, skipping NIM image pre-pull")
+        return False
+
+    def _ssh(command: str, timeout: int = 3600) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [*_ssh_command_prefix(user, host, key_file), command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    image = f"nvcr.io/nim/{model}:{tag}"
+    log(f"[nim-pull] logging in to NGC registry and pre-pulling {image} ...")
+
+    login = _ssh(
+        f"echo '{ngc_api_key}' | docker login nvcr.io -u '$oauthtoken' --password-stdin 2>&1",
+        timeout=60,
+    )
+    if login.returncode != 0:
+        log(f"[nim-pull] NGC login failed (non-fatal, deploy_nim will retry): {login.stderr[-300:]}")
+        return False
+
+    pull = _ssh(f"docker pull {image} 2>&1", timeout=3600)
+    if pull.returncode == 0:
+        log(f"[nim-pull] pre-pull of {image} complete")
+        return True
+    log(f"[nim-pull] pre-pull failed (non-fatal, deploy_nim will retry): {pull.stdout[-300:]}")
+    return False

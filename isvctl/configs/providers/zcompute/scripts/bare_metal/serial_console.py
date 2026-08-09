@@ -79,8 +79,16 @@ def main() -> int:
         code = e.response.get("Error", {}).get("Code", "")
         msg = e.response.get("Error", {}).get("Message", str(e))
 
-        is_not_supported = code in _NOT_IMPLEMENTED_CODES or any(
-            kw in msg.lower() for kw in ("not implemented", "not supported", "unsupported")
+        # Confirmed live across every BM run this session (2026-08-09),
+        # including right after a successful boot/lifecycle event: zcompute
+        # returns "ValidationError ... is not ready (HTTP 409)" here, not
+        # the 500 InternalFailure this script originally assumed. Same
+        # permanent platform gap, different error shape - treat it the
+        # same way.
+        is_not_supported = (
+            code in _NOT_IMPLEMENTED_CODES
+            or any(kw in msg.lower() for kw in ("not implemented", "not supported", "unsupported"))
+            or (code == "ValidationError" and "not ready" in msg.lower())
         )
 
         if is_not_supported:
