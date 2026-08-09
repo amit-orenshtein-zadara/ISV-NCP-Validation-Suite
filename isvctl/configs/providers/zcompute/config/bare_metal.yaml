@@ -465,6 +465,18 @@ tests:
           key_file: "{{steps.power_cycle_instance.key_file}}"
           expected_os: "ubuntu"
 
+    # Canonical suite's default max_recovery_time (900s) assumes a fast
+    # VM-style power-cycle - real GB200 bare-metal hardware confirmed live
+    # 2026-08-09 taking 2596s (~43 min) for a genuinely successful recovery
+    # (power_cycle_instance.py itself succeeded; only this threshold was
+    # too tight). Bumped with real margin, matching the generosity applied
+    # to every other bare-metal timeout on this hardware.
+    power_cycle_checks:
+      step: power_cycle_instance
+      checks:
+        InstancePowerCycleCheck:
+          max_recovery_time: 3600
+
     reinstall_ssh:
       step: reinstall_instance
       checks:
