@@ -62,6 +62,6 @@ runcmd:
   - apt-get -o DPkg::Lock::Timeout=600 -q update
   - apt-get -o DPkg::Lock::Timeout=600 -q install -y wireguard curl
   - systemctl daemon-reload
-  - systemctl enable --now wg-quick@wg0
+  - systemctl enable --now --no-block wg-quick@wg0
   - sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 99999/' /etc/ssh/sshd_config
   - systemctl restart ssh
