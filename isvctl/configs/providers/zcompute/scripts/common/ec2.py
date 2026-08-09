@@ -146,6 +146,51 @@ def wait_for_public_ip(
     return None
 
 
+def wait_for_private_ip(
+    ec2: Any,
+    instance_id: str,
+    timeout: int = 60,
+    interval: int = 5,
+) -> str | None:
+    """Poll describe_instances until PrivateIpAddress is non-empty/non-None.
+
+    Confirmed live (2026-08-09): PrivateIpAddress can still read back empty
+    for several seconds right after an instance transitions to 'running' -
+    a single un-retried describe_instances call right at that transition
+    can capture the field before zcompute finishes attaching the network
+    interface, silently leaving every downstream SSH call targeting an
+    empty host.
+
+    Args:
+        ec2:         Boto3 EC2 client.
+        instance_id: EC2 instance ID.
+        timeout:     Maximum seconds to wait.
+        interval:    Polling interval in seconds.
+
+    Returns:
+        Private IP string, or None if not available within timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = ec2.describe_instances(InstanceIds=[instance_id])
+        inst = resp["Reservations"][0]["Instances"][0]
+        ip = inst.get("PrivateIpAddress")
+        if ip and ip not in ("", "None"):
+            return ip
+        # Log the instance's actual network-interface state on each attempt
+        # (Aviv, 2026-08-09: suspected root cause is the network interface
+        # itself not attaching yet) - a bare "waiting" message gives no way
+        # to tell a missing NIC apart from a NIC that's attached but just
+        # hasn't reported an IP yet.
+        nics = inst.get("NetworkInterfaces", [])
+        log(
+            f"[poll] waiting for private IP on {instance_id} "
+            f"(state={inst.get('State', {}).get('Name')}, network_interfaces={len(nics)}) ..."
+        )
+        time.sleep(interval)
+    return None
+
+
 def _is_valid_private_key(key_file: str) -> bool:
     """Check whether a file on disk is a loadable SSH private key.
 

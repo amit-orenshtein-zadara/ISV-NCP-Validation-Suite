@@ -44,7 +44,13 @@ from botocore.exceptions import ClientError
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from common.client import get_client  # noqa: E402
-from common.ec2 import load_nvidia_modules, log, poll_instance_state, wait_for_public_ip  # noqa: E402
+from common.ec2 import (  # noqa: E402
+    load_nvidia_modules,
+    log,
+    poll_instance_state,
+    wait_for_private_ip,
+    wait_for_public_ip,
+)
 from common.ssh_utils import wait_for_ssh  # noqa: E402
 
 
@@ -164,9 +170,26 @@ def main() -> int:
 
         result["state"] = final_state
 
+        # PrivateIpAddress can still read back empty for a while right after
+        # the instance transitions to 'running' - a single un-retried
+        # describe_instances call here used to capture it before zcompute
+        # finished attaching the network interface, silently sending every
+        # downstream SSH call at an empty host (confirmed live 2026-08-09:
+        # 160 "Could not resolve hostname" attempts before the whole step
+        # failed). Retry for up to 10 minutes (Amit, 2026-08-09) and hard-
+        # stop here - never fall through to SSH (public or private) without
+        # a real private_ip in hand.
+        private_ip = wait_for_private_ip(ec2, args.instance_id, timeout=600, interval=10)
+        if not private_ip:
+            result["error"] = f"PrivateIpAddress not available after power-cycle for {args.instance_id}"
+            log(f"[power-cycle] result so far: {json.dumps(result, indent=2)}")
+            print(json.dumps(result, indent=2))
+            return 1
+        result["private_ip"] = private_ip
+        log(f"[power-cycle] private_ip obtained, result so far: {json.dumps(result, indent=2)}")
+
         resp = ec2.describe_instances(InstanceIds=[args.instance_id])
         inst = resp["Reservations"][0]["Instances"][0]
-        result["private_ip"] = inst.get("PrivateIpAddress")
 
         # public_ip is informational only, not a gate - the EIP is confirmed
         # unreachable from this run station anyway (2026-07-29), private_ip
