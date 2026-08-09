@@ -1,0 +1,456 @@
+# zcompute Bare Metal — FULL SUITE config, ORIGINAL step order
+# (all checks, reuse-safe)
+#
+# Identical to bare_metal_full_suite.yaml except for one thing: describe_instance
+# (and everything bound to it - gpu, host_os, gpu_stress, nccl, training, nvlink,
+# driver_info, infiniband, cpu_info, container_runtime, ssh, ethernet) runs LAST,
+# after stop/start/reboot/power_cycle, instead of before them. This is the order
+# bare_metal_full_suite.yaml used before 2026-08-09 - kept here as a second
+# option since which order is more useful depends on what you're trying to learn:
+#   - bare_metal_full_suite.yaml (stress/GPU first): get the fast stress-test
+#     answer before waiting through the multi-hour lifecycle sequence.
+#   - this file (lifecycle first, stress/GPU last): validate stress/GPU/driver
+#     health against the instance's FINAL post-power-cycle state, which is
+#     arguably the more realistic "did everything survive the full lifecycle"
+#     check - closer to what Test Run 372's original clean run represented.
+#
+# Same suite as bare_metal.yaml, but for iterating against a single
+# persistent instance instead of paying the ~30min create+network-attach
+# cost on every run.
+#   - launch_instance always reuses ZCOMPUTE_BM_INSTANCE_ID/KEY_FILE (the
+#     script itself already supports this — no config difference needed
+#     there, just export those env vars before running)
+#   - Full GPU setup runs on launch (--skip-gpu-setup removed) so
+#     GpuCheck/GpuStressCheck/NcclCheck etc. mean something
+#   - stop/start/reboot/power_cycle are real (not skip:true) — this is now
+#     a genuinely full run, lifecycle included. reinstall_instance stays
+#     skip:true, matching AWS's own reference config (which skips it too).
+#     Only ever point this at a disposable instance, never the "golden" one.
+#   - teardown / verify_teardown / teardown_nim are all skip:true — this
+#     config never tears anything down, on purpose
+#   - gpu marker + all excluded-by-name checks are unlocked (nothing
+#     excluded) — this is a real, paid full run, not the mechanics-only
+#     pass bare_metal.yaml still defaults to
+#
+# Usage:
+#   export ZCOMPUTE_BASE_URL=https://<gb200-cluster-ip>
+#   export AWS_ACCESS_KEY_ID=...
+#   export AWS_SECRET_ACCESS_KEY=...
+#   export AWS_REGION=symphony
+#   export ZCOMPUTE_BM_AMI_ID=ami-3ce3727bebb54502b931a59e47e40877
+#   export ZCOMPUTE_BM_INSTANCE_ID=i-xxx     # reuse an already-launched instance
+#   export ZCOMPUTE_BM_KEY_FILE=/tmp/amit-key.pem
+#   export NGC_API_KEY=...                   # needed for deploy_nim to do anything
+#   PYTHONPATH=isvctl/src:isvtest/src:isvreporter/src \
+#     uv run isvctl test run -f isvctl/configs/providers/zcompute/config/second-main-bm.YML -v
+
+import:
+  - ./bare_metal.yaml
+
+version: "1.0"
+
+commands:
+  bare_metal:
+    phases: ["setup", "test", "teardown"]
+    steps:
+      - name: launch_instance
+        phase: setup
+        command: "python3 ../scripts/bare_metal/launch_instance.py"
+        args:
+          - "--name"
+          - "BM-3"
+          - "--instance-type"
+          - "{{instance_type}}"
+          - "--region"
+          - "{{region}}"
+          - "--ami-id"
+          - "{{ami_id}}"
+          - "--vpc-id"
+          - "{{vpc_id}}"
+          - "--subnet-id"
+          - "{{subnet_id}}"
+          - "--key-name"
+          - "amit-key"
+        timeout: 5400
+
+      - name: list_instances
+        phase: test
+        command: "python3 ../scripts/vm/list_instances.py"
+        args:
+          - "--vpc-id"
+          - "{{steps.launch_instance.vpc_id}}"
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+        timeout: 120
+
+      - name: verify_tags
+        phase: test
+        command: "python3 ../scripts/bare_metal/describe_tags.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+        timeout: 60
+
+      - name: topology_placement
+        phase: test
+        command: "python3 ../scripts/bare_metal/topology_placement.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+        timeout: 120
+        continue_on_failure: true
+
+      - name: serial_console
+        phase: test
+        command: "python3 ../scripts/bare_metal/serial_console.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+        timeout: 60
+        continue_on_failure: true
+
+      - name: verify_image
+        phase: test
+        command: "python3 ../scripts/image-registry/verify_image_installed.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+        timeout: 60
+
+      - name: verify_config
+        phase: test
+        command: "python3 ../scripts/image-registry/verify_config_installable.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+        timeout: 60
+
+      # stop/start/reboot/power-cycle: real, enabled. Confirmed reliable on a
+      # disposable instance (2026-08-03/04) once launch_instance.py/
+      # start_instance.py/reboot_instance.py/power_cycle_instance.py's SSH-wait
+      # retry + private_ip-not-public_ip fixes landed — the older "powering
+      # off deletes the instance" note (2026-07-30) predates those fixes and
+      # no longer applies. Still: only ever point this config at a disposable
+      # instance (never the NVIDIA-recorded "golden" one) via
+      # ZCOMPUTE_BM_INSTANCE_ID/KEY_FILE — these steps are real and destructive
+      # if something goes wrong.
+      - name: stop_instance
+        phase: test
+        command: "python3 ../scripts/bare_metal/stop_instance.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+        # stop_instance.py's internal poll-for-'stopped' timeout was bumped
+        # from 1800s to 7200s (Aviv, 2026-08-06: "be very kind with your
+        # timeouts, bump it up") - outer timeout cleared to match with margin.
+        timeout: 7800
+
+      - name: start_instance
+        phase: test
+        command: "python3 ../scripts/bare_metal/start_instance.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+          - "--key-file"
+          - "{{steps.launch_instance.key_file}}"
+          - "--pre-start-delay"
+          - "600"
+        # start_instance.py now retries on a 4-hour (14400s) internal wall-clock
+        # budget (Aviv/Amit, 2026-08-06 - the old fixed 4-retries budget was far
+        # too short for real GB200 hardware). Outer timeout must clear that plus
+        # pre-start-delay (600s) and the post-running SSH-wait/module-load
+        # overhead - matches power_cycle_instance's budget below for consistency.
+        timeout: 19200
+
+      - name: reboot_instance
+        phase: test
+        command: "python3 ../scripts/bare_metal/reboot_instance.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+          - "--key-file"
+          - "{{steps.launch_instance.key_file}}"
+          - "--private-ip"
+          - "{{steps.launch_instance.private_ip}}"
+          - "--wait-before-check"
+          - "180"
+        # reboot_instance.py's internal poll-for-'running' timeout was bumped
+        # from 1800s to 3600s (Aviv, 2026-08-06: "be very kind with your
+        # timeouts, bump it up") - outer timeout cleared to match with margin.
+        timeout: 7200
+
+      - name: power_cycle_instance
+        phase: test
+        command: "python3 ../scripts/bare_metal/power_cycle_instance.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+          - "--key-file"
+          - "{{steps.launch_instance.key_file}}"
+          - "--pre-start-delay"
+          - "600"
+        # power_cycle_instance.py now also uses a 4-hour internal
+        # start_instances retry budget and a 7200s stop poll (matching
+        # start_instance.py/stop_instance.py's fixes) instead of the old
+        # fixed-4-retries budget - outer timeout bumped generously to clear
+        # that (Aviv, 2026-08-06: "be very kind with your timeouts, bump it
+        # up").
+        timeout: 28800
+
+      # Runs LAST in this config (unlike bare_metal_full_suite.yaml, where it
+      # was moved ahead of the lifecycle steps 2026-08-09) - captures the
+      # instance's FINAL state after the full stop/start/reboot/power_cycle
+      # sequence, so the stress/GPU/driver checks bound to this step validate
+      # against post-lifecycle reality.
+      - name: describe_instance
+        phase: test
+        command: "python3 ../scripts/bare_metal/describe_instance.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+          - "--key-file"
+          - "{{steps.launch_instance.key_file}}"
+        timeout: 120
+
+      # skip:true - AWS's own reference config skips this too (confirmed
+      # 2026-08-04) - root-volume-swap is destructive and not something
+      # either platform's reference exercises.
+      - name: reinstall_instance
+        phase: test
+        skip: true
+        command: "python3 ../scripts/bare_metal/reinstall_instance.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+          - "--key-file"
+          - "{{steps.launch_instance.key_file}}"
+        timeout: 6000
+
+      # timeout: sum of the script's own internal budgets (NGC login, fabric
+      # manager check ~300s, docker pull up to 3600s, docker run up to
+      # 1200s, health-endpoint poll up to 1800s) can exceed 6900s worst
+      # case — 1800s was killing this step mid-pull/mid-engine-build even
+      # when it would have eventually succeeded.
+      - name: deploy_nim
+        phase: test
+        command: "python3 ../../shared/deploy_nim.py"
+        args:
+          - "--host"
+          - "{{steps.launch_instance.private_ip}}"
+          - "--key-file"
+          - "{{steps.launch_instance.key_file}}"
+        timeout: 7200
+
+      # Teardown phase intentionally disabled for this debug config — the
+      # whole point is to keep iterating against the same instance.
+      - name: teardown_nim
+        phase: teardown
+        skip: true
+        command: "python3 ../../shared/teardown_nim.py"
+        args:
+          - "--host"
+          - "{{steps.launch_instance.private_ip}}"
+          - "--key-file"
+          - "{{steps.launch_instance.key_file}}"
+        timeout: 120
+
+      - name: teardown
+        phase: teardown
+        skip: true
+        command: "python3 ../scripts/bare_metal/teardown.py"
+        timeout: 3300
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+          - "--eip-allocation-id"
+          - "{{steps.launch_instance.eip_allocation_id}}"
+          - "--delete-key-pair"
+          - "--delete-security-group"
+          - "{{teardown_flag}}"
+
+      - name: verify_teardown
+        phase: teardown
+        skip: true
+        command: "python3 ../scripts/bare_metal/verify_terminated.py"
+        args:
+          - "--instance-id"
+          - "{{steps.launch_instance.instance_id}}"
+          - "--region"
+          - "{{region}}"
+          - "--security-group-id"
+          - "{{steps.launch_instance.security_group_id}}"
+          - "--key-name"
+          - "{{steps.launch_instance.key_name}}"
+        timeout: 120
+
+tests:
+  cluster_name: "zcompute-bm-validation-full-suite-lifecycle-first"
+  description: "zcompute Bare Metal (BMaaS) full suite, ORIGINAL order — lifecycle (stop/start/reboot/power_cycle) first, then GPU/stress checks against final post-lifecycle state, no teardown"
+
+  # Unlock everything — this is a real full-cost run against real GB200
+  # hardware, not the mechanics-only pass bare_metal.yaml defaults to.
+  exclude:
+    markers: []
+    # CloudInitCheck's metadata_service subtest checks for an EC2-style HTTP
+    # metadata service at 169.254.169.254 — confirmed NOT present on
+    # zcompute bare-metal (connection refused, 2026-07-30). cloud-init.log
+    # confirms why: DataSourceNoCloud, not DataSourceEc2 — no HTTP metadata
+    # service by design, not a bug. Unlike the GPU-marker exclusions this
+    # config deliberately unlocks, this one isn't hardware-dependent, so it
+    # stays excluded here too.
+    # SerialConsoleCheck/SerialConsoleRetentionCheck: console-output API
+    # returns "Instance ... is not ready (HTTP 409)" on zcompute bare-metal —
+    # confirmed across multiple instances/runs, a platform gap (console
+    # output isn't implemented/ready), not something our code can fix.
+    # TopologyPlacementCheck: placement groups not supported on zcompute -
+    # same category of permanent platform gap, confirmed across runs.
+    tests:
+      - CloudInitCheck
+      - SerialConsoleCheck
+      - SerialConsoleRetentionCheck
+      - TopologyPlacementCheck
+
+  # GPU-marked checks all resolve their SSH host the same way ssh/host_os/
+  # ethernet do (BaseValidation.get_ssh_config prefers public_ip over
+  # private_ip) — same override needed here, now that they're unlocked.
+  # NimHealthCheck/NimModelCheck/NimInferenceCheck need no override: they
+  # read the "host" field straight from deploy_nim's own output (already
+  # wired to private_ip in the steps above), not public_ip/private_ip.
+  validations:
+    gpu:
+      step: describe_instance
+      checks:
+        GpuCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+          # This GB200 compute tray has 4 GPUs, not the AWS-reference 8
+          # (confirmed via lspci/nvidia-smi, 2026-07-29).
+          expected_gpus: 4
+
+    host_os:
+      step: describe_instance
+      checks:
+        PciBusCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+          # Same real-hardware GPU count as GpuCheck above.
+          expected_gpus: 4
+
+    gpu_stress:
+      step: describe_instance
+      checks:
+        GpuStressCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+          runtime: 30
+          memory_gb: 16
+
+    nccl:
+      step: describe_instance
+      checks:
+        NcclCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+
+    training:
+      step: describe_instance
+      checks:
+        TrainingCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+          steps: 50
+
+    nvlink:
+      step: describe_instance
+      checks:
+        NvlinkCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+
+    driver_info:
+      step: describe_instance
+      checks:
+        DriverCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+
+    # InfiniBandCheck/CpuInfoCheck were missing this override (unlike every
+    # other check on this list) — they were resolving to describe_instance's
+    # public_ip (the EIP), which isn't reachable from the run station, and
+    # timing out on connect. Confirmed 2026-08-02: same private_ip fix as
+    # the rest of this list resolves it.
+    infiniband:
+      step: describe_instance
+      checks:
+        InfiniBandCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+          # 6 mlx5 CAs total: mlx5_0/1/3/4 are the real IB fabric NICs, mlx5_2
+          # is the DPU's first port (also Active) — mlx5_5 is the DPU's 2nd
+          # port, confirmed uncabled/expected-down (Ofir, 2026-07-30). With
+          # expected_ports set, InfiniBandCheck only fails below this count,
+          # not on any single port being down.
+          expected_ports: 5
+
+    cpu_info:
+      step: describe_instance
+      checks:
+        CpuInfoCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+
+    container_runtime:
+      step: describe_instance
+      checks:
+        ContainerRuntimeCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+
+    start_gpu:
+      step: start_instance
+      checks:
+        GpuCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+
+    reboot_gpu:
+      step: reboot_instance
+      checks:
+        GpuCheck:
+          host: "{{steps.describe_instance.private_ip}}"
+          key_file: "{{steps.describe_instance.key_file}}"
+          expected_gpus: 4
+
+    power_cycle_gpu:
+      step: power_cycle_instance
+      checks:
+        GpuCheck:
+          host: "{{steps.power_cycle_instance.private_ip}}"
+          key_file: "{{steps.power_cycle_instance.key_file}}"
+          expected_gpus: 4
