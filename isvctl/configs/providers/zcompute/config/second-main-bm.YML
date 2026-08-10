@@ -234,7 +234,11 @@ commands:
           - "{{steps.power_cycle_instance.private_ip}}"
           - "--key-file"
           - "{{steps.launch_instance.key_file}}"
-        timeout: 5400
+        # Bumped 5400s -> 7200s: now also pre-pulls GpuStressCheck's pytorch
+        # image and NcclCheck's hpc-benchmarks image (confirmed live
+        # 2026-08-10: the pytorch pull alone took ~13min cold) on top of
+        # the GPU-deps retry loop and NIM pre-pull.
+        timeout: 7200
 
       # Captures the instance's FINAL state after the full
       # stop/start/reboot/power_cycle sequence, so the stress/GPU/driver

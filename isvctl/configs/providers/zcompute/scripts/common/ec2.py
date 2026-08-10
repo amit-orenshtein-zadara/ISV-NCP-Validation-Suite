@@ -834,3 +834,36 @@ def pull_nim_image(
         return True
     log(f"[nim-pull] pre-pull failed (non-fatal, deploy_nim will retry): {pull.stdout[-300:]}")
     return False
+
+
+def pull_docker_image(host: str, user: str, key_file: str, image: str, timeout: int = 3600) -> bool:
+    """Pre-pull a public nvcr.io/nvidia/* image via SSH - no registry login required.
+
+    GpuStressCheck's nvcr.io/nvidia/pytorch image and NcclCheck's
+    nvcr.io/nvidia/hpc-benchmarks image are otherwise cold-pulled inside
+    those checks' own SSH command timeout every single lifecycle cycle -
+    zcompute bare-metal wipes /var/lib/docker (and everything else) on
+    every power event, so there's no persistent layer cache to fall back
+    on between runs. Confirmed live 2026-08-10: GpuStressCheck's cold pull
+    took ~13 minutes, close to its 900s budget. Same warmup rationale as
+    pull_nim_image() above.
+
+    Returns:
+        True if the pull succeeded, False otherwise (never raises - this
+        is a best-effort warmup, not a hard requirement, matching
+        pull_nim_image()'s contract).
+    """
+
+    def _ssh(command: str, timeout: int = timeout) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [*_ssh_command_prefix(user, host, key_file), command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    log(f"[image-pull] pre-pulling {image} ...")
+    pull = _ssh(f"sudo docker pull {image} 2>&1", timeout=timeout)
+    if pull.returncode == 0:
+        log(f"[image-pull] pre-pull of {image} complete")
+        return True
+    log(f"[image-pull] pre-pull of {image} failed (non-fatal, downstream check will pull it itself): {pull.stdout[-300:]}")
+    return False

@@ -15,9 +15,10 @@ known to be occasionally flaky (broken Mellanox DOCA repo, transient pulls).
 This step never fails the pipeline (Amit, 2026-08-10: "no need to hard fail
 anything ... after all dependencies are installed with retries -> continue
 with the tests") - it always exits 0 and always continues to
-describe_instance/deploy_nim/the GPU test wave regardless of outcome. NIM
-image pre-pull stays a single best-effort attempt, unchanged from before -
-deploy_nim.py re-pulls itself if this didn't happen.
+describe_instance/deploy_nim/the GPU test wave regardless of outcome. Image
+pre-pulls (NIM, GpuStressCheck's pytorch image, NcclCheck's hpc-benchmarks
+image) stay single best-effort attempts, unchanged from before - each
+downstream check/step re-pulls itself if its pre-pull didn't happen.
 
 Output JSON:
 {
@@ -27,7 +28,9 @@ Output JSON:
     "attempts": 1,
     "gpu_deps": {"docker": true, "nvidia_container_toolkit": true, "cuda_toolkit": true, "nvidia_smi_accessible": true, "gpu_docker_runtime_ok": true},
     "gpu_deps_verified": true,
-    "nim_image_prepulled": true
+    "nim_image_prepulled": true,
+    "gpu_stress_image_prepulled": true,
+    "nccl_image_prepulled": true
 }
 """
 
@@ -41,7 +44,7 @@ import time
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from common.ec2 import log, pull_nim_image, setup_gpu_dependencies  # noqa: E402
+from common.ec2 import log, pull_docker_image, pull_nim_image, setup_gpu_dependencies  # noqa: E402
 
 _REQUIRED_KEYS = ("docker", "nvidia_container_toolkit", "cuda_toolkit", "gpu_docker_runtime_ok")
 
@@ -64,6 +67,16 @@ def main() -> int:
         help="NIM model to pre-pull after GPU deps verify, matching deploy_nim.py's default",
     )
     parser.add_argument("--nim-tag", default="latest", help="NIM container image tag to pre-pull")
+    parser.add_argument(
+        "--gpu-stress-image",
+        default="nvcr.io/nvidia/pytorch:25.04-py3",
+        help="Image to pre-pull for GpuStressCheck, matching its class default",
+    )
+    parser.add_argument(
+        "--nccl-image",
+        default="nvcr.io/nvidia/hpc-benchmarks:25.04",
+        help="Image to pre-pull for NcclCheck, matching its class default",
+    )
     parser.add_argument("--max-attempts", type=int, default=5, help="Max setup_gpu_dependencies() attempts")
     parser.add_argument(
         "--retry-interval",
@@ -81,6 +94,8 @@ def main() -> int:
         "gpu_deps": {},
         "gpu_deps_verified": False,
         "nim_image_prepulled": False,
+        "gpu_stress_image_prepulled": False,
+        "nccl_image_prepulled": False,
     }
 
     try:
@@ -116,6 +131,17 @@ def main() -> int:
             args.ngc_api_key,
             model=args.nim_model,
             tag=args.nim_tag,
+        )
+
+        # GpuStressCheck/NcclCheck cold-pull these every lifecycle cycle
+        # otherwise (confirmed live 2026-08-10: ~13min pull against
+        # GpuStressCheck's 900s budget, cutting it close) - same public
+        # nvcr.io/nvidia/* warmup as the smoke test above, no login needed.
+        result["gpu_stress_image_prepulled"] = pull_docker_image(
+            args.private_ip, args.ssh_user, args.key_file, args.gpu_stress_image
+        )
+        result["nccl_image_prepulled"] = pull_docker_image(
+            args.private_ip, args.ssh_user, args.key_file, args.nccl_image
         )
 
     except Exception as e:
