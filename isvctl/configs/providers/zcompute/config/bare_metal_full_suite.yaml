@@ -263,17 +263,21 @@ commands:
       # 1200s, health-endpoint poll up to 1800s) can exceed 6900s worst
       # case — 1800s was killing this step mid-pull/mid-engine-build even
       # when it would have eventually succeeded.
-      # host/key-file now point at launch_instance directly, not
-      # power_cycle_instance — that step is skip:true in this config, so
-      # its output doesn't exist.
+      # host/key-file bind to describe_instance, not launch_instance -
+      # confirmed live 2026-08-10 that zcompute's private IP genuinely
+      # changes across the stop/start/reboot/power_cycle sequence
+      # (launch-time 7.243.41.47 vs. post-lifecycle 7.243.41.5 in the same
+      # run), so the launch-time IP is stale by the time this step runs.
+      # describe_instance runs right before this and reports the fresh IP -
+      # every other post-lifecycle check already binds to it the same way.
       - name: deploy_nim
         phase: test
         command: "python3 ../../shared/deploy_nim.py"
         args:
           - "--host"
-          - "{{steps.launch_instance.private_ip}}"
+          - "{{steps.describe_instance.private_ip}}"
           - "--key-file"
-          - "{{steps.launch_instance.key_file}}"
+          - "{{steps.describe_instance.key_file}}"
         timeout: 7200
 
       # Teardown phase intentionally disabled for this debug config — the
