@@ -207,6 +207,25 @@ commands:
         # up").
         timeout: 28800
 
+      # setup_gpu_dependencies()/pull_nim_image() are idempotent - retry with
+      # real verification (gpu_docker_runtime_ok) before any downstream test
+      # relies on Docker/CUDA/NIM, since zcompute bare-metal wipes these on
+      # every power event (see power_cycle_instance.py's docstring). Never
+      # hard-fails by design (Amit, 2026-08-10: "no need to hard fail
+      # anything ... after all dependencies are installed with retries ->
+      # continue with the tests") - continue_on_failure is defensive
+      # belt-and-suspenders only, the script itself always exits 0.
+      - name: install_gpu_dependencies
+        phase: test
+        continue_on_failure: true
+        command: "python3 ../scripts/bare_metal/install_gpu_dependencies.py"
+        args:
+          - "--private-ip"
+          - "{{steps.power_cycle_instance.private_ip}}"
+          - "--key-file"
+          - "{{steps.launch_instance.key_file}}"
+        timeout: 5400
+
       - name: describe_instance
         phase: test
         command: "python3 ../scripts/bare_metal/describe_instance.py"

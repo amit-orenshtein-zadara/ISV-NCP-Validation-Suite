@@ -14,15 +14,13 @@ zcompute-specific notes:
     ignores the flag, this degrades to an ordinary graceful stop, which
     still exercises most of what InstancePowerCycleCheck cares about.
   - Same GPU-resource-release retry loop as start_instance.py.
-  - Reinstalls GPU dependencies (Docker, NVIDIA Container Toolkit, CUDA
-    toolkit) after recovery, same as launch_instance.py does at initial
-    launch — confirmed live 2026-08-09 that zcompute bare-metal does NOT
-    persist post-boot filesystem changes across stop/start/reboot/power-
-    cycle (dpkg had zero record of a manually-verified-working Docker
-    install after a power-cycle). Only what's baked into the base AMI
-    (driver, nvidia-ctk) survives. This is the last lifecycle step before
-    the stress/GPU/NCCL/driver checks run, so it's the natural place to
-    do this rather than repeating it after every lifecycle step.
+  - Does NOT reinstall GPU dependencies (Docker, CUDA, NIM image) itself -
+    that's install_gpu_dependencies.py, a dedicated step that runs
+    immediately after this one (with retries + real verification) since
+    zcompute bare-metal does NOT persist post-boot filesystem changes
+    across stop/start/reboot/power-cycle (confirmed live 2026-08-09: dpkg
+    had zero record of a manually-verified-working Docker install after a
+    power-cycle - only what's baked into the base AMI survives).
 
 Output JSON:
 {
@@ -37,9 +35,7 @@ Output JSON:
     "time_to_stopped_seconds": 842.3,
     "ssh_ready": true,
     "recovery_seconds": 900,
-    "nvidia_modules_loaded": true,
-    "gpu_deps": {"docker": true, "nvidia_container_toolkit": true, "cuda_toolkit": true, "nvidia_smi_accessible": true},
-    "nim_image_prepulled": true
+    "nvidia_modules_loaded": true
 }
 """
 
@@ -60,8 +56,6 @@ from common.ec2 import (  # noqa: E402
     load_nvidia_modules,
     log,
     poll_instance_state,
-    pull_nim_image,
-    setup_gpu_dependencies,
     wait_for_private_ip,
     wait_for_public_ip,
 )
@@ -77,16 +71,6 @@ def main() -> int:
     parser.add_argument(
         "--pre-start-delay", type=int, default=600,
         help="Seconds to wait after power-off before issuing start (default: 600)",
-    )
-    parser.add_argument(
-        "--nim-model", default="meta/llama-3.2-1b-instruct",
-        help="NIM model to pre-pull after recovery, matching deploy_nim.py's default",
-    )
-    parser.add_argument("--nim-tag", default="latest", help="NIM container image tag to pre-pull")
-    parser.add_argument(
-        "--ngc-api-key",
-        default=os.environ.get("NGC_API_KEY", "") or os.environ.get("NGC_NIM_API_KEY", ""),
-        help="NGC API key for pre-pulling the NIM image (same env fallback as deploy_nim.py)",
     )
     args = parser.parse_args()
 
@@ -251,36 +235,6 @@ def main() -> int:
 
         nvidia_ok = load_nvidia_modules(result["private_ip"], args.ssh_user, args.key_file)
         result["nvidia_modules_loaded"] = nvidia_ok
-
-        # zcompute bare-metal does NOT persist post-boot filesystem changes
-        # across stop/start/reboot/power-cycle - confirmed live 2026-08-09:
-        # dpkg had zero record of docker-ce ever being installed after a
-        # power-cycle, despite it being manually confirmed working
-        # immediately beforehand. Only what's baked into the base AMI
-        # (driver, nvidia-ctk) survives; anything apt-installed afterward
-        # (Docker, CUDA toolkit) is wiped every time. power_cycle_instance
-        # is the last lifecycle step before the stress/GPU/NCCL/driver
-        # checks run, so this is where GPU deps need to be freshly
-        # reinstalled - stop/start/reboot don't need this since nothing
-        # downstream of them (before power_cycle) depends on Docker/CUDA
-        # being present yet.
-        result["gpu_deps"] = {}
-        try:
-            log("[power-cycle] reinstalling GPU dependencies (Docker, NCT, CUDA) - "
-                "zcompute bare-metal doesn't persist these across power events ...")
-            result["gpu_deps"] = setup_gpu_dependencies(result["private_ip"], args.ssh_user, args.key_file)
-        except Exception as e:
-            log(f"[power-cycle] WARNING: setup_gpu_dependencies failed (non-fatal): {e}")
-
-        # Pre-pull the NIM image here too, right after Docker comes back up -
-        # deploy_nim.py's own docker pull was consuming most of its outer
-        # step timeout on a cold cache (confirmed live 2026-08-09). Best-
-        # effort: never fails this step, deploy_nim.py still pulls again
-        # (near-instantly) if this is skipped/fails.
-        result["nim_image_prepulled"] = pull_nim_image(
-            result["private_ip"], args.ssh_user, args.key_file, args.ngc_api_key,
-            model=args.nim_model, tag=args.nim_tag,
-        )
 
         result["success"] = final_state == "running"
         log(f"[power-cycle] completed successfully! (recovery={result['recovery_seconds']}s)")

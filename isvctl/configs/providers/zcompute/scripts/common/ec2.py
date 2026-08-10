@@ -514,6 +514,7 @@ def setup_gpu_dependencies(host: str, user: str, key_file: str) -> dict[str, boo
         "nvidia_container_toolkit": False,
         "cuda_toolkit": False,
         "nvidia_smi_accessible": False,
+        "gpu_docker_runtime_ok": False,
     }
 
     # ── 0. Fix any pre-existing NVML mismatch BEFORE touching apt ────────────
@@ -742,6 +743,24 @@ def setup_gpu_dependencies(host: str, user: str, key_file: str) -> dict[str, boo
         r = _ssh(restore_cmds, timeout=300)
         results["nvidia_smi_accessible"] = r.returncode == 0
         print(f"[setup] nvidia-smi restore: {r.stdout.strip()}", file=sys.stderr)
+
+    # ── 4.5. Functional smoke test: docker + NVIDIA runtime actually work ───
+    # Everything above only checks install commands' exit codes - none of
+    # that proves `docker run --gpus all` actually works end-to-end. This is
+    # the real signal callers (e.g. install_gpu_dependencies.py's retry loop)
+    # should act on. Same image ContainerRuntimeCheck already pulls
+    # (isvtest/src/isvtest/validations/host.py), so that check's pull is
+    # warm by the time it runs.
+    smoke = _ssh(
+        "sudo docker run --rm --gpus all nvcr.io/nvidia/cuda:13.0.0-base-ubuntu24.04 "
+        "nvidia-smi --query-gpu=name --format=csv,noheader",
+        timeout=180,
+    )
+    results["gpu_docker_runtime_ok"] = smoke.returncode == 0 and bool(smoke.stdout.strip())
+    if results["gpu_docker_runtime_ok"]:
+        print(f"[setup] GPU docker runtime smoke test passed: {smoke.stdout.strip()}", file=sys.stderr)
+    else:
+        print(f"[setup] GPU docker runtime smoke test FAILED: {smoke.stderr[-300:]}", file=sys.stderr)
 
     # ── 5. Post-install diagnostics: verify version consistency ─────────────
     diag2 = _ssh(
