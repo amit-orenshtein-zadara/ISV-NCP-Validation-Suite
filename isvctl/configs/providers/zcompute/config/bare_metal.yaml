@@ -489,13 +489,17 @@ tests:
     # VM-style power-cycle - real GB200 bare-metal hardware confirmed live
     # 2026-08-09 taking 2596s (~43 min) for a genuinely successful recovery
     # (power_cycle_instance.py itself succeeded; only this threshold was
-    # too tight). Bumped with real margin, matching the generosity applied
-    # to every other bare-metal timeout on this hardware.
+    # too tight). Bumped to 3600s, then breached again live 2026-08-09/10
+    # at 3615s (recovery_seconds is captured right after SSH comes up, only
+    # covering boot - it does not include the GPU-deps reinstall/NIM
+    # pre-pull that run afterward, so this is pure hardware boot-time
+    # variance, not our own added steps). Bumped again with real margin
+    # instead of chasing single-digit-percent overruns run to run.
     power_cycle_checks:
       step: power_cycle_instance
       checks:
         InstancePowerCycleCheck:
-          max_recovery_time: 3600
+          max_recovery_time: 5400
 
     reinstall_ssh:
       step: reinstall_instance
