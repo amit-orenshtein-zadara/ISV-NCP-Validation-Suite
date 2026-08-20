@@ -170,13 +170,33 @@ tests:
             "nvidia.com/mig.capable": "true"
             "nvidia.com/mig.strategy": "single"
 
+    k8s_network:
+      checks:
+        K8sApiNetworkAclCheck:
+          # Real external vantage point (2026-08-05): 172.30.8.71 is a VM
+          # with no route/allow-list entry to the API server, reachable via
+          # SSH from the manager VM this suite runs on. sshpass supplies the
+          # password non-interactively; ACL_PROBE_VM_PASSWORD must be
+          # exported in the environment running isvctl (kept out of this
+          # committed file on purpose - do not hardcode it here).
+          # Deliberately a literal $VAR (shell expansion at command execution),
+          # NOT a Jinja {{ env.X }} expression - isvctl's redaction.py strips
+          # any env var ending in a sensitive suffix like _PASSWORD from the
+          # Jinja `env` context before templates render, so {{ env.X }} would
+          # never see it. A plain $VAR is expanded by the shell subprocess
+          # itself, after config templating has already finished.
+          commands:
+            unauthorized_probe: >-
+              sshpass -p "$ACL_PROBE_VM_PASSWORD" ssh
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+              -o ConnectTimeout=5 ubuntu@172.30.8.71
+              "curl --max-time 5 -sk https://172.28.12.196:6443/readyz"
+          api_endpoint: "https://172.28.12.196:6443"
+
   exclude:
     tests:
       # Static cluster — no managed node pool API
       - K8sNodePoolCheck
-
-      # Requires an external (out-of-allow-list) vantage point to probe from
-      - K8sApiNetworkAclCheck
 
       # CNCF conformance is a long-running suite (hours) — run separately
       - K8sCncfConformanceCheck
