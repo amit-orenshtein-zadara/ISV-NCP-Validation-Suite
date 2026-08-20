@@ -1,0 +1,46 @@
+# zcompute Bare Metal — Host-level GPU checks (Bm* validations)
+#
+# Runs BmCudaVersion, BmDriverInstalled, BmDriverVersion,
+# BmGpuComputeCapability, BmGpuDetection, BmGpuHealth directly against the
+# machine isvctl itself runs on - unlike GpuCheck/DriverCheck (in
+# bare_metal_full_suite.yaml), these six classes call run_command() which
+# defaults to LocalRunner (local subprocess, no SSH - see
+# isvtest/src/isvtest/tests/test_validations.py). That's why they're not
+# wired into bare_metal.yaml/bare_metal_full_suite.yaml (isvctl runs from a
+# separate run-station there, SSHing into the instance) - here, isvctl must
+# run ON the bare-metal GB200 instance itself so nvidia-smi resolves to the
+# real GPUs. Same pattern already used by providers/minikube.yaml for the
+# same six checks.
+#
+# Usage (run directly on the BM host):
+#   PYTHONPATH=isvctl/src:isvtest/src:isvreporter/src \
+#     uv run isvctl test run -f isvctl/configs/providers/zcompute/config/bare_metal_host_checks.yaml -v -s
+
+version: "1.0"
+
+commands:
+  bare_metal:
+    phases: ["setup", "test"]
+    steps:
+      # The framework requires at least one step to run at all (empty steps
+      # is treated as a hard orchestration failure, not a no-op) - the six
+      # Bm* checks below don't read step output, so this just satisfies that.
+      - name: noop
+        phase: setup
+        command: "echo '{}'"
+        timeout: 10
+
+tests:
+  platform: bare_metal
+  cluster_name: "zcompute-bm-host-checks"
+  description: "zcompute Bare Metal - host-level GPU/driver/CUDA checks (run directly on the instance)"
+
+  validations:
+    bare_metal:
+      checks:
+        BmDriverInstalled: {}
+        BmDriverVersion: {}
+        BmCudaVersion: {}
+        BmGpuDetection: {}
+        BmGpuHealth: {}
+        BmGpuComputeCapability: {}
