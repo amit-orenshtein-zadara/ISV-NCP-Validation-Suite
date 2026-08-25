@@ -16,6 +16,7 @@ Provides consistent error type classification for all AWS scripts.
 import functools
 import json
 import logging
+import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -65,6 +66,16 @@ TRANSIENT_AWS_CODES: frozenset[str] = frozenset(
         "RequestTimeout",
         "RequestTimeoutException",
     }
+)
+
+# zCompute's vpc-backend rejects VPC deletion while the VPC's CoreDNS service VM is still being
+# provisioned (InvalidParameterValue, message below). The condition clears once provisioning
+# finishes, so deletes wait it out instead of leaking the VPC - provisioning can outlast any
+# fixed pre-delete settle when the backend workers are loaded.
+SERVICE_VM_PROVISIONING_MSG = "service VM is being provisioned"
+SERVICE_VM_PROVISIONING_RETRY_SECONDS = float(os.environ.get("ZCOMPUTE_SERVICE_VM_PROVISIONING_RETRY_SECONDS", "10"))
+SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS = float(
+    os.environ.get("ZCOMPUTE_SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS", "120")
 )
 
 
@@ -120,7 +131,10 @@ def delete_with_retry(
 
     Already-gone errors (``Invalid*.NotFound`` etc.) count as success - the
     desired end state is reached. Non-transient errors are logged and
-    return ``False`` without retry.
+    return ``False`` without retry. One exception: the zCompute rejection
+    "service VM is being provisioned" is waited out (it clears on its own,
+    up to ``SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS``) without consuming
+    the regular attempt budget.
 
     Args:
         fn: The bound boto3 method to call (e.g. ``ec2.delete_vpc``).
@@ -138,7 +152,10 @@ def delete_with_retry(
         reason about the returned ``False`` (e.g., record as orphan for later cleanup).
     """
     last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    provisioning_deadline = time.monotonic() + SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS
+    attempt = 0
+    while attempt < attempts:
+        attempt += 1
         try:
             fn(*args, **kwargs)
             return True
@@ -146,6 +163,21 @@ def delete_with_retry(
             code = e.response.get("Error", {}).get("Code", "")
             if code in ALREADY_GONE_CODES:
                 return True
+            if (
+                code == "InvalidParameterValue"
+                and SERVICE_VM_PROVISIONING_MSG in str(e)
+                and time.monotonic() < provisioning_deadline
+            ):
+                # Waiting out service-VM provisioning is expected, not a failed attempt -
+                # don't burn the transient-attempt budget on it.
+                attempt -= 1
+                logger.warning(
+                    "%s is still provisioning its service VM; retrying delete in %.0fs",
+                    resource_desc,
+                    SERVICE_VM_PROVISIONING_RETRY_SECONDS,
+                )
+                time.sleep(SERVICE_VM_PROVISIONING_RETRY_SECONDS)
+                continue
             if code in transient_codes and attempt < attempts:
                 last_error = e
                 delay = backoff_seconds * attempt

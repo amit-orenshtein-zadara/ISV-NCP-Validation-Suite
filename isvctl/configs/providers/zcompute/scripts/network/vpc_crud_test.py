@@ -24,6 +24,11 @@ sys.path.insert(0, str(_here.parents[1]))  # providers/zcompute/scripts (has cli
 from common.client import get_client   # verify=False already handled
 from common.errors import delete_with_retry, handle_aws_errors
 
+# Seconds to wait after a VPC reaches "available" before it may be deleted, so its asynchronous
+# CoreDNS service VM (nova + vm-manager) finishes provisioning. Mirrors
+# providers/aws/scripts/common/vpc.py::settle_after_vpc_available.
+_SERVICE_VM_SETTLE_SECONDS = float(os.environ.get("ZCOMPUTE_SERVICE_VM_SETTLE_SECONDS", "30"))
+
 
 def _poll_vpc_available(ec2: Any, vpc_id: str, timeout: int = 120, interval: int = 5) -> str:
     """Return VPC state once available, or last known state on timeout."""
@@ -184,6 +189,13 @@ def main() -> int:
 
         vpc_id = create_result["vpc_id"]
         result["network_id"] = vpc_id
+
+        # Let the async CoreDNS service VM settle right after creation (test_create_vpc already
+        # polled the VPC to "available") - BEFORE any sub-test can fail - so every exit path
+        # (including the finally cleanup) deletes the VPC only after provisioning finished.
+        # Deleting earlier orphans the service VM on older vpc-backend, or is rejected with
+        # InvalidParameterValue ("service VM is being provisioned") on newer vpc-backend.
+        time.sleep(_SERVICE_VM_SETTLE_SECONDS)
 
         result["tests"]["read_vpc"] = test_read_vpc(ec2, vpc_id)
         result["tests"]["update_tags"] = test_update_tags(ec2, vpc_id)

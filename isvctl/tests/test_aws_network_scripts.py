@@ -1343,3 +1343,130 @@ def test_delete_peering_connections_discovery_failure_is_swallowed() -> None:
 
     assert deleted == []
     assert ec2.deleted == []
+
+
+# --- delete_with_retry: service-VM-provisioning rejection (common/errors.py) ---
+
+AWS_COMMON_SCRIPTS = ISVCTL_ROOT / "configs" / "providers" / "aws" / "scripts" / "common"
+ZCOMPUTE_COMMON_SCRIPTS = ISVCTL_ROOT / "configs" / "providers" / "zcompute" / "scripts" / "common"
+
+_PROVISIONING_MESSAGE = "Cannot delete vpc x while its service VM is being provisioned"
+
+
+def _load_common_script(base: Path, script_name: str) -> ModuleType:
+    """Load a provider common script (e.g. errors.py) as a module."""
+    script_path = base / script_name
+    module_name = f"test_common_{base.parents[1].name}_{script_path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeClock:
+    """Replaces time.sleep/time.monotonic so retry waits run instantly."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.mark.parametrize("base", [AWS_COMMON_SCRIPTS, ZCOMPUTE_COMMON_SCRIPTS], ids=["aws", "zcompute"])
+def test_delete_with_retry_waits_out_service_vm_provisioning(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provisioning rejection clears once the service VM is up - keep retrying until then."""
+    errors_mod = _load_common_script(base, "errors.py")
+    clock = _FakeClock()
+    monkeypatch.setattr(errors_mod.time, "sleep", clock.sleep)
+    monkeypatch.setattr(errors_mod.time, "monotonic", clock.monotonic)
+
+    calls = {"n": 0}
+
+    def fake_delete(**_kwargs: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _client_error("DeleteVpc", code="InvalidParameterValue", message=_PROVISIONING_MESSAGE)
+
+    assert errors_mod.delete_with_retry(fake_delete, VpcId="vpc-x", resource_desc="VPC vpc-x") is True
+    assert calls["n"] == 3
+    # The provisioning waits must not burn the regular (transient) attempt budget.
+    assert len(clock.sleeps) == 2
+
+
+@pytest.mark.parametrize("base", [AWS_COMMON_SCRIPTS, ZCOMPUTE_COMMON_SCRIPTS], ids=["aws", "zcompute"])
+def test_delete_with_retry_provisioning_timeout_gives_up(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A service VM stuck in provisioning must not retry forever."""
+    errors_mod = _load_common_script(base, "errors.py")
+    clock = _FakeClock()
+    monkeypatch.setattr(errors_mod.time, "sleep", clock.sleep)
+    monkeypatch.setattr(errors_mod.time, "monotonic", clock.monotonic)
+
+    def always_provisioning(**_kwargs: Any) -> None:
+        raise _client_error("DeleteVpc", code="InvalidParameterValue", message=_PROVISIONING_MESSAGE)
+
+    assert errors_mod.delete_with_retry(always_provisioning, VpcId="vpc-x", resource_desc="VPC vpc-x") is False
+    assert clock.now >= errors_mod.SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize("base", [AWS_COMMON_SCRIPTS, ZCOMPUTE_COMMON_SCRIPTS], ids=["aws", "zcompute"])
+def test_delete_with_retry_other_invalid_parameter_not_retried(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generic InvalidParameterValue (e.g. 'Resources still exist') stays non-retryable."""
+    errors_mod = _load_common_script(base, "errors.py")
+    clock = _FakeClock()
+    monkeypatch.setattr(errors_mod.time, "sleep", clock.sleep)
+    monkeypatch.setattr(errors_mod.time, "monotonic", clock.monotonic)
+
+    calls = {"n": 0}
+
+    def resources_exist(**_kwargs: Any) -> None:
+        calls["n"] += 1
+        raise _client_error(
+            "DeleteVpc", code="InvalidParameterValue", message="Resources still exist for vpc x : networks"
+        )
+
+    assert errors_mod.delete_with_retry(resources_exist, VpcId="vpc-x", resource_desc="VPC vpc-x") is False
+    assert calls["n"] == 1
+    assert clock.sleeps == []
+
+
+def test_teardown_delete_with_retry_waits_out_service_vm_provisioning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """teardown's local delete_with_retry must also wait out the provisioning rejection,
+    or an early teardown (test phase failed fast) leaks the VPC."""
+    module = _load_network_script("teardown.py")
+    clock = _FakeClock()
+    monkeypatch.setattr(module.time, "sleep", clock.sleep)
+    monkeypatch.setattr(module.time, "monotonic", clock.monotonic)
+
+    calls = {"n": 0}
+
+    def fake_delete(**_kwargs: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _client_error("DeleteVpc", code="InvalidParameterValue", message=_PROVISIONING_MESSAGE)
+
+    assert module.delete_with_retry(fake_delete, "vpc", VpcId="vpc-x") is True
+    assert calls["n"] == 3
+
+
+@pytest.mark.parametrize("base", [AWS_COMMON_SCRIPTS, ZCOMPUTE_COMMON_SCRIPTS], ids=["aws", "zcompute"])
+def test_provisioning_knobs_are_env_overridable(base: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZCOMPUTE_SERVICE_VM_PROVISIONING_RETRY_SECONDS", "1")
+    monkeypatch.setenv("ZCOMPUTE_SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS", "7")
+    errors_mod = _load_common_script(base, "errors.py")
+    assert errors_mod.SERVICE_VM_PROVISIONING_RETRY_SECONDS == 1.0
+    assert errors_mod.SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS == 7.0

@@ -43,7 +43,12 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 import boto3
 from botocore.exceptions import ClientError
 from common.ec2 import sanitize_key_name
-from common.errors import handle_aws_errors
+from common.errors import (
+    SERVICE_VM_PROVISIONING_MSG,
+    SERVICE_VM_PROVISIONING_RETRY_SECONDS,
+    SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS,
+    handle_aws_errors,
+)
 from common.vpc import delete_peering_connections_for_vpc
 
 logger = logging.getLogger(__name__)
@@ -51,15 +56,34 @@ logger = logging.getLogger(__name__)
 
 def delete_with_retry(func, resource_type: str, max_retries: int = 5, **kwargs) -> bool:
     """Delete resource with retry for dependency errors."""
-    for attempt in range(max_retries):
+    provisioning_deadline = time.monotonic() + SERVICE_VM_PROVISIONING_TIMEOUT_SECONDS
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
         try:
             func(**kwargs)
             return True
         except ClientError as e:
             error_code = e.response["Error"]["Code"]
+            if (
+                error_code == "InvalidParameterValue"
+                and SERVICE_VM_PROVISIONING_MSG in str(e)
+                and time.monotonic() < provisioning_deadline
+            ):
+                # zCompute rejects VPC deletion while the CoreDNS service VM is still being
+                # provisioned; the condition clears on its own, so wait it out without
+                # consuming the retry budget (an early teardown would otherwise leak the VPC).
+                attempt -= 1
+                logger.warning(
+                    "%s is still provisioning its service VM; retrying delete in %.0fs",
+                    resource_type,
+                    SERVICE_VM_PROVISIONING_RETRY_SECONDS,
+                )
+                time.sleep(SERVICE_VM_PROVISIONING_RETRY_SECONDS)
+                continue
             if error_code == "DependencyViolation":
-                if attempt < max_retries - 1:
-                    time.sleep(5 * (attempt + 1))
+                if attempt < max_retries:
+                    time.sleep(5 * attempt)
                     continue
             elif error_code in [
                 "InvalidGroup.NotFound",
@@ -127,6 +151,13 @@ def teardown_vpc(ec2: Any, vpc_id: str) -> dict[str, Any]:
     instance_key_names: set[str] = set()
     for reservation in instances["Reservations"]:
         for instance in reservation["Instances"]:
+            tag_keys = {t["Key"] for t in instance.get("Tags", [])}
+            if "managed_by_VPC" in tag_keys:
+                # zCompute service VMs (e.g. the per-VPC CoreDNS) are managed by the VPC
+                # service and can only be removed by deleting the VPC itself; calling
+                # TerminateInstances on them is rejected (403, surfaced as
+                # InternalServerError) and would abort the whole teardown.
+                continue
             instance_ids.append(instance["InstanceId"])
             if instance.get("KeyName"):
                 instance_key_names.add(instance["KeyName"])

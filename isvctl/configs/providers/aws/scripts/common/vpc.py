@@ -18,6 +18,7 @@ Provides common VPC operations used across network test scripts:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 # reports available. Tests that create and then quickly delete a VPC can race that provisioning
 # and orphan the service VM (or kill its boot volume mid-boot). Wait this long after a VPC is
 # available so the service VM is fully created before the caller proceeds to delete it.
-_SERVICE_VM_SETTLE_SECONDS = 30
+_SERVICE_VM_SETTLE_SECONDS = float(os.environ.get("ZCOMPUTE_SERVICE_VM_SETTLE_SECONDS", "30"))
 
 
 def settle_after_vpc_available() -> None:
